@@ -50,104 +50,163 @@ async function getConfig() {
 
 async function exportNotes(fromCLI = false, outputDir = null) {
   const config = await getConfig();
+  const maxRetries = 3;
+  let attempt = 0;
 
-  // Create temp path for database copy
-  const tmpDbPath = path.join(os.tmpdir(), `notes-db-${Date.now()}.sqlite`);
+  while (attempt < maxRetries) {
+    const tmpDbPath = path.join(
+      outputDir ? path.resolve(outputDir) : os.tmpdir(),
+      `notes-db-${Date.now()}.sqlite`
+    );
 
-  try {
-    // Copy database to temp location
-    await fs.copyFile(NOTES_DB_PATH, tmpDbPath);
-    console.log("copied the file!", tmpDbPath);
-
-    // Use the temp database instead
-    const db = new sqlite3.Database(tmpDbPath);
-
-    const exportDir = outputDir
-      ? path.resolve(outputDir)
-      : path.join(os.tmpdir(), `notes-export-${Date.now()}`);
-
-    console.log("exportdir", exportDir);
-
-    if (fromCLI) {
-      console.log(`Exporting to directory: ${exportDir}`);
-    }
-    await fs.mkdir(exportDir, { recursive: true });
-
-    const query = `
-    SELECT 
-      Z.Z_PK as key,
-      _FOLDER.ZTITLE2 as folder,
-      NOTEDATA.ZDATA as data,
-      Z.ZCREATIONDATE1 as date,
-      Z.ZTITLE1 as title
-    FROM ZICCLOUDSYNCINGOBJECT as Z
-    INNER JOIN ZICCLOUDSYNCINGOBJECT AS _FOLDER 
-      ON Z.ZFOLDER = _FOLDER.Z_PK
-    INNER JOIN ZICNOTEDATA as NOTEDATA 
-      ON Z.ZNOTEDATA = NOTEDATA.Z_PK
-  `;
-
-    return new Promise((resolve, reject) => {
-      db.all(query, async (err, rows) => {
-        if (err) reject(err);
-
-        try {
-          for (const note of rows) {
-            try {
-              const folderPath = path.join(exportDir, note.folder);
-              await fs.mkdir(folderPath, { recursive: true });
-
-              const fileName = `${note.key} - ${note.title.replace(
-                /[^a-z0-9]/gi,
-                "_"
-              )}.md`;
-              const filePath = path.join(folderPath, fileName);
-
-              const timestamp = (note.date + 978307200) * 1000;
-              const buffer = Buffer.from(note.data);
-              const decompressed = await gunzip(buffer);
-              const content = convertToMarkdown(decompressed.toString("utf-8"));
-
-              await fs.writeFile(filePath, content);
-              await fs.utimes(filePath, timestamp, timestamp);
-            } catch (error) {
-              if (error.code === "Z_DATA_ERROR") {
-                console.log(`Skipping encrypted/locked note: ${note.key}`);
-                continue;
-              }
-              console.error(`Error processing note ${note.title}:`, error);
-            }
-          }
-
-          if (!fromCLI) {
-            // Only move files to repo if not called from CLI
-            await fs.rm(config.repoPath, { recursive: true, force: true });
-            await fs.cp(exportDir, config.repoPath, { recursive: true });
-            await fs.rm(exportDir, { recursive: true });
-          } else if (!outputDir) {
-            // If CLI but no output dir specified, keep files in temp dir
-            console.log(`Notes exported to: ${exportDir}`);
-          }
-
-          db.close();
-          resolve();
-        } catch (error) {
-          console.error("Error processing notes:", error);
-          db.close();
-          reject(error);
-        }
-      });
-    });
-  } catch (error) {
-    console.error("Error processing notes:", error);
-    throw error;
-  } finally {
-    // Clean up the temporary database file
     try {
-      await fs.unlink(tmpDbPath);
-    } catch (err) {
-      console.warn("Could not clean up temporary database file:", err);
+      // Copy database to temp location
+      await fs.copyFile(NOTES_DB_PATH, tmpDbPath);
+
+      // Add a small delay to ensure the file is fully written and released
+      const fileHandle = await fs.open(tmpDbPath, "r");
+      await fileHandle.sync();
+      await fileHandle.close();
+
+      // Verify the copy was successful
+      const sourceStats = await fs.stat(NOTES_DB_PATH);
+      const destStats = await fs.stat(tmpDbPath);
+
+      if (destStats.size !== sourceStats.size) {
+        throw new Error(
+          "Database copy verification failed: file sizes do not match"
+        );
+      }
+
+      // Open database with read-only mode and timeout
+      const db = new sqlite3.Database(
+        tmpDbPath,
+        sqlite3.OPEN_READONLY,
+        (err) => {
+          if (err) throw new Error(`Failed to open database: ${err.message}`);
+        }
+      );
+
+      const exportDir = outputDir
+        ? path.resolve(outputDir)
+        : path.join(os.tmpdir(), `notes-export-${Date.now()}`);
+
+      if (fromCLI) {
+        console.log(`Exporting to directory: ${exportDir}`);
+      }
+      await fs.mkdir(exportDir, { recursive: true });
+
+      const query = `
+      SELECT 
+        Z.Z_PK as key,
+        _FOLDER.ZTITLE2 as folder,
+        NOTEDATA.ZDATA as data,
+        Z.ZCREATIONDATE1 as date,
+        Z.ZTITLE1 as title
+      FROM ZICCLOUDSYNCINGOBJECT as Z
+      INNER JOIN ZICCLOUDSYNCINGOBJECT AS _FOLDER 
+        ON Z.ZFOLDER = _FOLDER.Z_PK
+      INNER JOIN ZICNOTEDATA as NOTEDATA 
+        ON Z.ZNOTEDATA = NOTEDATA.Z_PK
+    `;
+
+      return new Promise((resolve, reject) => {
+        db.all(query, async (err, rows) => {
+          if (err) reject(err);
+
+          try {
+            for (const note of rows) {
+              try {
+                const folderPath = path.join(exportDir, note.folder);
+                await fs.mkdir(folderPath, { recursive: true });
+
+                const fileName = `${note.key} - ${note.title.replace(
+                  /[^a-z0-9]/gi,
+                  "_"
+                )}.md`;
+                const filePath = path.join(folderPath, fileName);
+
+                const timestamp = (note.date + 978307200) * 1000;
+                const buffer = Buffer.from(note.data);
+                const decompressed = await gunzip(buffer);
+                const content = convertToMarkdown(
+                  decompressed.toString("utf-8")
+                );
+
+                await fs.writeFile(filePath, content);
+                await fs.utimes(filePath, timestamp, timestamp);
+              } catch (error) {
+                if (error.code === "Z_DATA_ERROR") {
+                  console.log(`Skipping encrypted/locked note: ${note.key}`);
+                  continue;
+                }
+                console.error(`Error processing note ${note.title}:`, error);
+              }
+            }
+
+            if (!fromCLI) {
+              // Only move files to repo if not called from CLI
+              await fs.rm(config.repoPath, { recursive: true, force: true });
+              await fs.cp(exportDir, config.repoPath, { recursive: true });
+              await fs.rm(exportDir, { recursive: true });
+            } else if (!outputDir) {
+              // If CLI but no output dir specified, keep files in temp dir
+              console.log(`Notes exported to: ${exportDir}`);
+            }
+
+            db.close();
+
+            // Clean up SQLite files
+            const baseFileName = path.parse(tmpDbPath).name;
+            const dbDir = path.dirname(tmpDbPath);
+            const filesToDelete = [
+              tmpDbPath,
+              path.join(dbDir, `${baseFileName}.sqlite-shm`),
+              path.join(dbDir, `${baseFileName}.sqlite-wal`),
+            ];
+
+            for (const file of filesToDelete) {
+              try {
+                await fs.unlink(file);
+              } catch (err) {
+                // Ignore errors if files don't exist
+                if (err.code !== "ENOENT") {
+                  console.warn(`Could not delete file ${file}:`, err);
+                }
+              }
+            }
+
+            resolve();
+          } catch (error) {
+            console.error("Error processing notes:", error);
+            db.close();
+            reject(error);
+          }
+        });
+      });
+    } catch (error) {
+      attempt++;
+      console.error(`Attempt ${attempt}/${maxRetries} failed:`, error.message);
+
+      // Clean up the temporary database file
+      try {
+        await fs.unlink(tmpDbPath);
+      } catch (cleanupErr) {
+        console.warn("Could not clean up temporary database file:", cleanupErr);
+      }
+
+      if (attempt === maxRetries) {
+        throw new Error(
+          `Failed to export notes after ${maxRetries} attempts: ${error.message}`
+        );
+      }
+
+      // Wait before retrying
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      continue;
     }
+
+    break; // If we get here, the export was successful
   }
 }
 
