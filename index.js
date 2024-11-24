@@ -10,6 +10,9 @@ import path from "path";
 import debounce from "lodash-es/debounce.js";
 import { fileURLToPath } from "url";
 import { dirname } from "path";
+import zlib from "zlib";
+import { Buffer } from "buffer";
+import os from "os";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -23,6 +26,8 @@ const NOTES_DB_PATH = path.join(__dirname, "NoteStore.sqlite");
 
 let isRunning = false;
 let watcher;
+
+const gunzip = promisify(zlib.gunzip);
 
 async function setupConfig(repoPath) {
 	const config = {
@@ -44,11 +49,16 @@ async function getConfig() {
 	}
 }
 
-async function exportNotes() {
+async function exportNotes(fromCLI = false) {
 	const config = await getConfig();
 	const db = new sqlite3.Database(NOTES_DB_PATH);
 
-	// Updated query to match Java implementation
+	const tmpDir = path.join(os.tmpdir(), `notes-export-${Date.now()}`);
+	if (fromCLI) {
+		console.log(`Exporting to temporary directory: ${tmpDir}`);
+	}
+	await fs.mkdir(tmpDir, { recursive: true });
+
 	const query = `
     SELECT 
       Z.Z_PK as key,
@@ -67,35 +77,70 @@ async function exportNotes() {
 		db.all(query, async (err, rows) => {
 			if (err) reject(err);
 
-			await fs.writeFile("result.json", JSON.stringify(rows, null, 2));
+			try {
+				for (const note of rows) {
+					try {
+						const folderPath = path.join(tmpDir, note.folder);
+						await fs.mkdir(folderPath, { recursive: true });
 
-			for (const note of rows) {
-				// Create folder if it doesn't exist
-				const folderPath = path.join(config.repoPath, note.folder);
-				await fs.mkdir(folderPath, { recursive: true });
+						const fileName = `${note.key} - ${note.title.replace(
+							/[^a-z0-9]/gi,
+							"_"
+						)}.md`;
+						const filePath = path.join(folderPath, fileName);
 
-				// Create filename with key and sanitized title
-				const fileName = `${note.key} - ${note.title.replace(
-					/[^a-z0-9]/gi,
-					"_"
-				)}.md`;
-				const filePath = path.join(folderPath, fileName);
+						const timestamp = (note.date + 978307200) * 1000;
+						const buffer = Buffer.from(note.data);
+						const decompressed = await gunzip(buffer);
+						const content = getPlainText(decompressed.toString("utf-8"));
 
-				// Convert creation date (Core Data to Unix timestamp)
-				const timestamp = (note.date + 978307200) * 1000;
+						await fs.writeFile(filePath, content);
+						await fs.utimes(filePath, timestamp, timestamp);
+					} catch (error) {
+						if (error.code === "Z_DATA_ERROR") {
+							console.log(`Skipping encrypted/locked note: ${note.key}`);
+							continue;
+						}
+						console.error(`Error processing note ${note.title}:`, error);
+					}
+				}
 
-				// TODO: You'll need to implement decompression for note.data
-				// The Java version uses GZIP decompression and custom text extraction
-				await fs.writeFile(filePath, note.data);
+				if (!fromCLI) {
+					// Only move files to repo if not called from CLI
+					await fs.rm(config.repoPath, { recursive: true, force: true });
+					await fs.cp(tmpDir, config.repoPath, { recursive: true });
+				}
 
-				// Set the file modification time
-				await fs.utimes(filePath, timestamp, timestamp);
+				if (!fromCLI) {
+					// Only cleanup temp directory if not called from CLI
+					await fs.rm(tmpDir, { recursive: true });
+				}
+
+				db.close();
+				resolve();
+			} catch (error) {
+				console.error("Error processing notes:", error);
+				db.close();
+				reject(error);
 			}
-
-			db.close();
-			resolve();
 		});
 	});
+}
+
+function getPlainText(input) {
+	const startIndex = input.indexOf("\u0008\u0000\u0010\u0000\u001a");
+	if (startIndex === -1) return input;
+
+	const contentStart = input.indexOf("\u0012", startIndex + 1);
+	if (contentStart === -1) return input;
+
+	const contentEnd = input.indexOf(
+		"\u0004\u0008\u0000\u0010\u0000\u0010\u0000\u001a\u0004\u0008\u0000",
+		contentStart + 2
+	);
+	if (contentEnd === -1) return input.substring(contentStart + 2);
+
+	return input.substring(contentStart + 2, contentEnd);
 }
 
 const syncToGit = debounce(async () => {
@@ -180,6 +225,6 @@ program
 program
 	.command("export")
 	.description("Export notes to Git")
-	.action(exportNotes);
+	.action(() => exportNotes(true));
 
 program.parse();
