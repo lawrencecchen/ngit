@@ -28,3 +28,4 @@ pids/
 
 NoteStore.sqlite*
 result.json
+ngit-test/*
