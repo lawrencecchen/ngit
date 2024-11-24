@@ -15,10 +15,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const CONFIG_FILE = path.join(process.env.HOME, ".ngit.json");
-const NOTES_DB_PATH = path.join(
-	process.env.HOME,
-	"Library/Group Containers/group.com.apple.notes/NoteStore.sqlite"
-);
+// const NOTES_DB_PATH = path.join(
+// 	process.env.HOME,
+// 	"Library/Group Containers/group.com.apple.notes/NoteStore.sqlite"
+// );
+const NOTES_DB_PATH = path.join(__dirname, "NoteStore.sqlite");
 
 let isRunning = false;
 let watcher;
@@ -47,25 +48,48 @@ async function exportNotes() {
 	const config = await getConfig();
 	const db = new sqlite3.Database(NOTES_DB_PATH);
 
-	// Note: This is a simplified query. You'd need to handle attachments and formatting
+	// Updated query to match Java implementation
 	const query = `
     SELECT 
-      z_pk,
-      ztitle,
-      zbody,
-      zmodificationdate
-    FROM ziccloudsyncingobject 
-    WHERE ztitle IS NOT NULL
+      Z.Z_PK as key,
+      _FOLDER.ZTITLE2 as folder,
+      NOTEDATA.ZDATA as data,
+      Z.ZCREATIONDATE1 as date,
+      Z.ZTITLE1 as title
+    FROM ZICCLOUDSYNCINGOBJECT as Z
+    INNER JOIN ZICCLOUDSYNCINGOBJECT AS _FOLDER 
+      ON Z.ZFOLDER = _FOLDER.Z_PK
+    INNER JOIN ZICNOTEDATA as NOTEDATA 
+      ON Z.ZNOTEDATA = NOTEDATA.Z_PK
   `;
 
 	return new Promise((resolve, reject) => {
 		db.all(query, async (err, rows) => {
 			if (err) reject(err);
 
+			await fs.writeFile("result.json", JSON.stringify(rows, null, 2));
+
 			for (const note of rows) {
-				const fileName = `${note.ztitle.replace(/[^a-z0-9]/gi, "_")}.md`;
-				const filePath = path.join(config.repoPath, fileName);
-				await fs.writeFile(filePath, note.zbody);
+				// Create folder if it doesn't exist
+				const folderPath = path.join(config.repoPath, note.folder);
+				await fs.mkdir(folderPath, { recursive: true });
+
+				// Create filename with key and sanitized title
+				const fileName = `${note.key} - ${note.title.replace(
+					/[^a-z0-9]/gi,
+					"_"
+				)}.md`;
+				const filePath = path.join(folderPath, fileName);
+
+				// Convert creation date (Core Data to Unix timestamp)
+				const timestamp = (note.date + 978307200) * 1000;
+
+				// TODO: You'll need to implement decompression for note.data
+				// The Java version uses GZIP decompression and custom text extraction
+				await fs.writeFile(filePath, note.data);
+
+				// Set the file modification time
+				await fs.utimes(filePath, timestamp, timestamp);
 			}
 
 			db.close();
